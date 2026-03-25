@@ -1,4 +1,4 @@
-const CACHE_NAME = "radio-stream-pwa-v1";
+const CACHE_NAME = "radio-stream-pwa-v2";
 const PRECACHE_URLS = [
   "/",
   "/manifest.json",
@@ -18,12 +18,38 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(self.clients.claim().catch(() => {}));
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== CACHE_NAME)
+            .map((key) => caches.delete(key))
+        )
+      )
+      .then(() => self.clients.claim())
+      .catch(() => {})
+  );
 });
 
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  const isSameOrigin = url.origin === self.location.origin;
+  const isStaticAsset =
+    request.destination === "image" ||
+    request.destination === "style" ||
+    request.destination === "script" ||
+    request.destination === "font" ||
+    url.pathname === "/" ||
+    url.pathname === "/manifest.json" ||
+    url.pathname === "/favicon.ico" ||
+    url.pathname.startsWith("/icons/");
+
+  // Never cache stream/API/cross-origin requests.
+  if (!isSameOrigin || !isStaticAsset) return;
 
   event.respondWith(
     caches

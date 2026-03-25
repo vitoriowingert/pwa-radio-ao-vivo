@@ -13,6 +13,7 @@ type RadioPlayerProps = {
 const RETRY_DELAY_MIN_MS = 3000;
 const RETRY_DELAY_MAX_MS = 5000;
 const WAITING_TIMEOUT_MS = 15000;
+const INITIAL_WAITING_TIMEOUT_MS = 30000;
 const STALL_TIMEOUT_MS = 15000;
 const AUTO_ERROR_AFTER_FAILURES = 2; // quantas falhas consecutivas antes de mostrar "Erro"
 
@@ -43,6 +44,8 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
   const autoplayFailureCountRef = useRef<number>(0);
   const playAttemptIdRef = useRef<number>(0);
   const recoverFailureCountRef = useRef<number>(0);
+  const hasStartedPlayingRef = useRef<boolean>(false);
+  const autoplayBlockedRef = useRef<boolean>(false);
 
   const attemptPlayRef = useRef<
     (mode: AttemptMode, options?: AttemptOptions) => Promise<void>
@@ -52,6 +55,14 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
   const [volume, setVolume] = useState(0.8); // 0..1
   const [isMuted, setIsMuted] = useState(false);
   const lastNonZeroVolumeRef = useRef<number>(0.8);
+  /** Keep output prefs fresh for audio callbacks (avoid stale closures). */
+  const volumeRef = useRef(volume);
+  const isMutedRef = useRef(isMuted);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+    isMutedRef.current = isMuted;
+  }, [volume, isMuted]);
 
   const persistVolume = useCallback((value: number) => {
     try {
@@ -150,6 +161,15 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
         }
       }
 
+      // Without a user gesture, only muted play() is reliably allowed; sync real volume/mute on `playing`.
+      if (mode === "user") {
+        const v = volumeRef.current;
+        audio.volume = v;
+        audio.muted = isMutedRef.current || v === 0;
+      } else {
+        audio.muted = true;
+      }
+
       try {
         const maybePromise = audio.play();
         await maybePromise;
@@ -158,8 +178,23 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
 
         autoplayFailureCountRef.current = 0;
         setStatusSafe("playing");
-      } catch {
+      } catch (error) {
+        const err = error as Error & { name?: string; message?: string };
+        const hasUserActivation =
+          typeof navigator !== "undefined" && "userActivation" in navigator
+            ? (
+                navigator as Navigator & {
+                  userActivation?: { hasBeenActive?: boolean; isActive?: boolean };
+                }
+              ).userActivation?.hasBeenActive ?? null
+            : null;
         if (attemptId !== playAttemptIdRef.current) return;
+
+        if (err?.name === "NotAllowedError" && hasUserActivation === false) {
+          autoplayBlockedRef.current = true;
+          setStatusSafe("idle");
+          return;
+        }
 
         const silentOnFail = mode === "autoplay" && options?.silentOnFail;
         if (silentOnFail) {
@@ -178,9 +213,9 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
           scheduleRetry({
             reason: "autoplay",
             showError: !isFirstFailure,
-            // Quando o autoplay falha "silenciosamente", forçamos reload no retry
-            // para reduzir o tempo até a conexão efetiva do stream.
-            reload: true,
+            // Before first successful playback, avoid forcing `load()` again.
+            // Re-loading here causes reconnect loops on some streaming endpoints.
+            reload: false,
           });
           return;
         }
@@ -202,6 +237,22 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
   useEffect(() => {
     attemptPlayRef.current = attemptPlay;
   }, [attemptPlay]);
+
+  useEffect(() => {
+    const onUserActivation = () => {
+      if (!autoplayBlockedRef.current || !shouldPlayRef.current) return;
+      autoplayBlockedRef.current = false;
+      void attemptPlayRef.current("user", { reload: false, silentOnFail: false });
+    };
+
+    window.addEventListener("pointerdown", onUserActivation, { passive: true });
+    window.addEventListener("keydown", onUserActivation);
+
+    return () => {
+      window.removeEventListener("pointerdown", onUserActivation);
+      window.removeEventListener("keydown", onUserActivation);
+    };
+  }, []);
 
   useEffect(() => {
     const mql = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -338,6 +389,10 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
   }, []);
 
   useEffect(() => {
+    setAudioReady(Boolean(audioRef.current));
+  }, []);
+
+  useEffect(() => {
     if (!STREAM_URL) {
       let cancelled = false;
       const apply = () => {
@@ -349,21 +404,30 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
       if (typeof queueMicrotask === "function") queueMicrotask(apply);
       else void Promise.resolve().then(apply);
 
-      audioRef.current = null;
       return () => {
         cancelled = true;
       };
     }
 
-    // Register SW for PWA "install" support
     if ("serviceWorker" in navigator) {
-      void navigator.serviceWorker.register("/sw.js").catch(() => {});
+      // Register SW only in production to avoid dev caching issues.
+      if (process.env.NODE_ENV === "production") {
+        void navigator.serviceWorker.register("/sw.js").catch(() => {});
+      } else {
+        // Clear stale SW/caches from previous builds in development.
+        void navigator.serviceWorker
+          .getRegistrations()
+          .then((registrations) =>
+            Promise.all(registrations.map((registration) => registration.unregister()))
+          )
+          .catch(() => {});
+      }
     }
 
-    const audio = new Audio(STREAM_URL);
+    const audio = audioRef.current;
+    if (!audio) return;
     audio.preload = "auto";
-    audio.crossOrigin = "anonymous";
-    audioRef.current = audio;
+    audio.src = STREAM_URL;
     const applyAudioReady = () => setAudioReady(true);
     if (typeof queueMicrotask === "function") queueMicrotask(applyAudioReady);
     else void Promise.resolve().then(applyAudioReady);
@@ -378,6 +442,10 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
 
     const onPlaying = () => {
       if (!shouldPlayRef.current) return;
+      const v = volumeRef.current;
+      audio.volume = v;
+      audio.muted = isMutedRef.current || v === 0;
+      hasStartedPlayingRef.current = true;
       waitingSinceRef.current = null;
       lastProgressAtRef.current = Date.now();
       autoplayFailureCountRef.current = 0;
@@ -401,7 +469,7 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
       scheduleRetry({
         reason: "stalled",
         showError,
-        reload: true,
+        reload: hasStartedPlayingRef.current,
       });
     };
 
@@ -413,7 +481,7 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
       scheduleRetry({
         reason: "error",
         showError,
-        reload: true,
+        reload: hasStartedPlayingRef.current,
       });
     };
 
@@ -425,7 +493,7 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
       scheduleRetry({
         reason: "ended",
         showError,
-        reload: true,
+        reload: hasStartedPlayingRef.current,
       });
     };
 
@@ -450,9 +518,9 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
     audio.addEventListener("timeupdate", onTimeUpdate);
     audio.addEventListener("progress", onProgress);
 
-    // Autoplay on load (silent failure)
+    // Autoplay on load: do not call load() again — we already loaded above; a second load() often breaks the first connection.
     const runAutoplay = () => {
-      void attemptPlay("autoplay", { reload: true, silentOnFail: true });
+      void attemptPlay("autoplay", { reload: false, silentOnFail: true });
     };
     if (typeof queueMicrotask === "function") queueMicrotask(runAutoplay);
     else void Promise.resolve().then(runAutoplay);
@@ -466,7 +534,12 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
       audio.removeEventListener("ended", onEnded);
       audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("progress", onProgress);
-      audioRef.current = null;
+      audio.removeAttribute("src");
+      try {
+        audio.load();
+      } catch {
+        // ignore
+      }
       setAudioReady(false);
 
       if (retryTimeoutRef.current != null) {
@@ -525,7 +598,10 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
           }
         }
 
-        if (waitingSinceRef.current != null && now - waitingSince > WAITING_TIMEOUT_MS) {
+        const timeoutMs = hasStartedPlayingRef.current
+          ? WAITING_TIMEOUT_MS
+          : INITIAL_WAITING_TIMEOUT_MS;
+        if (waitingSinceRef.current != null && now - waitingSince > timeoutMs) {
           waitingSinceRef.current = null;
           recoverFailureCountRef.current += 1;
           const showError =
@@ -534,7 +610,7 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
           scheduleRetry({
             reason: "waiting-timeout",
             showError,
-            reload: true,
+            reload: hasStartedPlayingRef.current,
           });
           return;
         }
@@ -585,6 +661,7 @@ export default function RadioPlayer({ streamUrl, logoUrl }: RadioPlayerProps) {
 
   return (
     <div className="mx-auto w-full max-w-sm">
+      <audio ref={audioRef} preload="auto" playsInline className="hidden" />
       <div className={cardClassName}>
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">

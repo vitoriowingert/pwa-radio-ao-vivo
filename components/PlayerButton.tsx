@@ -22,8 +22,9 @@ export default function PlayerButton({
   let onClick = onPlay;
 
   if (status === "loading") {
-    label = "Ouvir";
-    disabled = true;
+    label = "Conectando…";
+    disabled = false;
+    onClick = onPlay;
   } else if (status === "playing") {
     label = "Pausar";
     onClick = onPause;
